@@ -1,4 +1,10 @@
-streamlit
-pandas==2.1.0
-openpyxl
-pdfplumber
+# Streamlit core
+streamlit>=1.26.0
+
+# Data handling
+pandas==3.0.1   # prebuilt wheel for Python 3.13
+openpyxl         # Excel support
+pdfplumber       # PDF extraction
+
+# Optional enhancements
+rich>=14.3.3     # pretty console/log output
