@@ -6,9 +6,8 @@ from difflib import get_close_matches
 from io import BytesIO
 from openpyxl import load_workbook
 import os
-from pathlib import Path
 
-# ---------------- Your extraction functions ----------------
+# ---------------- Extraction functions ----------------
 def extract_sb_data(pdf_path):
     sb_data = []
 
@@ -31,10 +30,8 @@ def extract_sb_data(pdf_path):
 
         iec_value = re.search(iec_regex, text)
         iec_value = iec_value.group(1) if iec_value else ""
-
         gstin_value = re.search(gstin_regex, text)
         gstin_value = gstin_value.group(1) if gstin_value else ""
-
         cbcode_value = re.search(cbcode_regex, text)
         cbcode_value = cbcode_value.group(1) if cbcode_value else ""
 
@@ -103,7 +100,6 @@ def extract_invoice_tables(pdf_path):
 def extract_invoice_details_from_all_pages(tables_dict, sb_df=None):
     if sb_df is None or sb_df.empty:
         sb_df = pd.DataFrame()
-
     invoice_rows = []
 
     for page_name, page_df in tables_dict.items():
@@ -161,9 +157,9 @@ uploaded_files = st.file_uploader(
     "Upload PDF files (multiple allowed)", type=["pdf"], accept_multiple_files=True
 )
 
+combined_sb_df = pd.DataFrame()
 if uploaded_files:
     st.info("Processing PDFs...")
-    combined_sb_df = pd.DataFrame()
     for uploaded_file in uploaded_files:
         pdf_path = f"temp_uploaded.pdf"
         with open(pdf_path, "wb") as f:
@@ -179,6 +175,7 @@ if uploaded_files:
         st.subheader("📊 Combined SB Data")
         st.dataframe(combined_sb_df)
 
+        # Download combined SB data
         towrite = BytesIO()
         combined_sb_df.to_excel(towrite, index=False, engine='openpyxl')
         towrite.seek(0)
@@ -186,5 +183,39 @@ if uploaded_files:
             label="⬇️ Download Combined SB Data as Excel",
             data=towrite,
             file_name="Combined_SB_Data.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+# ---------------- Upload Template to Fill ----------------
+st.subheader("📥 Upload Excel Template to Fill Data")
+uploaded_excel = st.file_uploader(
+    "Upload Excel file containing 'SHIPPINGBILL NO' column", type=["xlsx"]
+)
+
+if uploaded_excel and not combined_sb_df.empty:
+    template_df = pd.read_excel(uploaded_excel)
+    if "SHIPPINGBILL NO" not in template_df.columns:
+        st.error("❌ The Excel must contain 'SHIPPINGBILL NO' column.")
+    else:
+        # Normalize SB numbers
+        template_df["SHIPPINGBILL NO"] = template_df["SHIPPINGBILL NO"].astype(str).str.strip()
+        combined_sb_df["SHIPPINGBILL NO"] = combined_sb_df["SHIPPINGBILL NO"].astype(str).str.strip()
+
+        # Merge extracted data into template
+        filled_df = template_df.merge(
+            combined_sb_df, on="SHIPPINGBILL NO", how="left", suffixes=("", "_extracted")
+        )
+
+        st.subheader("✅ Filled Template Preview")
+        st.dataframe(filled_df)
+
+        # Download filled Excel
+        towrite = BytesIO()
+        filled_df.to_excel(towrite, index=False, engine='openpyxl')
+        towrite.seek(0)
+        st.download_button(
+            label="⬇️ Download Filled Excel",
+            data=towrite,
+            file_name="Filled_SB_Template.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
