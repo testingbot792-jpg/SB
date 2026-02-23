@@ -1,10 +1,14 @@
-# Streamlit core
-streamlit>=1.26.0
+# Streamlit (must stay <3 pandas)
+streamlit>=1.26.0,<2.0
 
-# Data handling
-pandas==3.0.1   # prebuilt wheel for Python 3.13
-openpyxl         # Excel support
-pdfplumber       # PDF extraction
+# Pandas compatible with Streamlit
+pandas>=1.5,<3.0
 
-# Optional enhancements
-rich>=14.3.3     # pretty console/log output
+# Excel support
+openpyxl
+
+# PDF extraction
+pdfplumber
+
+# Optional: nicer logging in Streamlit
+rich>=14.3.3
