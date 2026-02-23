@@ -1,8 +1,8 @@
-import win32com.client
+# import win32com.client
 from pathlib import Path
 
 import os
-import win32com.client
+# import win32com.client
 from pathlib import Path
 
 def download_pdfs_from_outlook(folder_name, sb_numbers, download_dir="temp_pdfs"):
@@ -615,3 +615,4 @@ if uploaded_sih and effective_combined_df is not None and not effective_combined
 
     else:
         st.warning("⚠️ Could not find 'Invoice Id' in the first 5 rows of SIH file.")
+
