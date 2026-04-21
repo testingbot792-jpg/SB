@@ -1,8 +1,59 @@
+import win32com.client
+from pathlib import Path
 
+import os
+import win32com.client
+from pathlib import Path
 
+def download_pdfs_from_outlook(folder_name, sb_numbers, download_dir="temp_pdfs"):
+    """
+    Connects to Outlook, searches the given folder for emails that have PDF attachments
+    containing any of the specified Shipping Bill Numbers in their filename.
+    Downloads those attachments into download_dir (absolute path).
+    """
+    # ✅ Use absolute, guaranteed-valid path (under user's Documents)
+    base_path = Path.home() / "Documents" / download_dir
+    base_path.mkdir(parents=True, exist_ok=True)
 
+    outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    inbox = outlook.GetDefaultFolder(6)  # 6 = Inbox
+    target_folder = None
 
+    # Try to find the subfolder "abc" (case-insensitive)
+    for folder in inbox.Folders:
+        if folder.Name.lower() == folder_name.lower():
+            target_folder = folder
+            break
 
+    if not target_folder:
+        print(f"❌ Folder '{folder_name}' not found in Outlook Inbox.")
+        return []
+
+    print(f"📂 Searching Outlook folder '{folder_name}' for matching PDFs...")
+
+    downloaded_files = []
+    messages = target_folder.Items
+
+    for msg in messages:
+        attachments = msg.Attachments
+        for att in attachments:
+            if att.FileName.lower().endswith(".pdf"):
+                for sb_no in sb_numbers:
+                    if str(sb_no) in att.FileName:
+                        # ✅ Safe absolute path
+                        safe_filename = att.FileName.replace(":", "_").replace("\\", "_").replace("/", "_")
+                        save_path = str(base_path / safe_filename)
+                        att.SaveAsFile(save_path)
+                        downloaded_files.append(save_path)
+                        print(f"✅ Downloaded: {att.FileName}")
+                        break  # Move to next attachment
+
+    if not downloaded_files:
+        print("⚠️ No matching PDF attachments found.")
+    else:
+        print(f"📦 {len(downloaded_files)} PDFs downloaded to '{base_path}'.")
+
+    return downloaded_files
 
 import streamlit as st
 import pandas as pd
@@ -11,6 +62,7 @@ import re
 from difflib import get_close_matches
 from io import BytesIO
 import os
+from openpyxl import load_workbook
 # ---------------- Your existing extraction functions ----------------
 def extract_sb_data(pdf_path):
     sb_data = []
@@ -133,25 +185,24 @@ def extract_invoice_tables(pdf_path):
 
 def extract_invoice_details_from_all_pages(tables_dict, sb_df=None):
     """
-    Loop over all pages after Page_1, check if J13 contains
-    "2.BUYER'S NAME & ADDRESS", and extract invoice/drawee/goods details.
-    Append each page's data as a new row to sb_df.
+    Extracts *all* invoices from all 'PART - II - INVOICE DETAILS' pages,
+    and duplicates SB-level info for each invoice.
     """
-    if sb_df is None:
+    if sb_df is None or sb_df.empty:
         sb_df = pd.DataFrame()
 
+    invoice_rows = []
+
     for page_name, page_df in tables_dict.items():
-        # Skip Page_1
         if page_name == "Page_1":
             continue
 
         page_df = page_df.fillna("").astype(str)
         try:
-            # Check if row 13, col J (index 12, 9) contains "2.BUYER'S NAME & ADDRESS"
             if page_df.shape[0] >= 13 and page_df.shape[1] >= 10:
                 check_cell = page_df.iat[12, 9].strip().upper()
                 if "2.BUYER'S NAME & ADDRESS".upper() in check_cell:
-                    # ✅ Extract invoice no & date from C12
+                    # Extract invoice number and date
                     invoice_no, invoice_date = "", ""
                     if page_df.shape[0] >= 12 and page_df.shape[1] >= 3:
                         cell_val = page_df.iat[11, 2].strip()
@@ -162,43 +213,49 @@ def extract_invoice_details_from_all_pages(tables_dict, sb_df=None):
                         else:
                             invoice_no = cell_val
 
-                    # ✅ Drawee Name from J14
+                    # Extract drawee name
                     drawee_name = page_df.iat[13, 9].strip() if page_df.shape[0] >= 14 else ""
 
-                    # ✅ Drawee Address from J15–J18
+                    # Extract drawee address (next few rows)
                     drawee_address_parts = []
-                    for r in range(14, min(18, page_df.shape[0])):
+                    for r in range(14, min(19, page_df.shape[0])):
                         val = page_df.iat[r, 9].strip()
-                        if val and len(val) > 2:  # filter out stray characters
+                        if len(val) > 2:
                             drawee_address_parts.append(val)
                     drawee_address = " ".join(drawee_address_parts)
-                    
 
-                    # ✅ Goods Description from E29
+                    # Goods description
                     goods_desc = page_df.iat[28, 4].strip() if page_df.shape[0] >= 29 else ""
 
-                    # ✅ PORT OF DESTINATION (if exists in Page_1)
+                    # Port of destination
                     port_of_dest = ""
-                    if "Page_1" in tables_dict and tables_dict["Page_1"].shape[0] >= 14 and tables_dict["Page_1"].shape[1] >= 30:
-                        port_of_dest = tables_dict["Page_1"].iat[13, 29].strip()
+                    if "Page_1" in tables_dict:
+                        page1_df = tables_dict["Page_1"].fillna("").astype(str)
+                        if page1_df.shape[0] >= 14 and page1_df.shape[1] >= 30:
+                            port_of_dest = page1_df.iat[13, 29].strip()
 
-                    # --- Create new row dict ---
-                    new_row = {
+                    invoice_rows.append({
                         "INVOICE NO": invoice_no,
                         "INVOICE DATE": invoice_date,
                         "DRAWEE NAME": drawee_name,
                         "DRAWEE ADDRESS": drawee_address,
                         "GOODS DESCRIPTION": goods_desc,
                         "PORT OF DESTINATION": port_of_dest
-                    }
-
-                    # Append to SB DataFrame
-                    sb_df = pd.concat([sb_df, pd.DataFrame([new_row])], ignore_index=True)
-
+                    })
         except Exception as e:
             print(f"Error processing {page_name}: {e}")
 
-    return sb_df
+    # ✅ Combine SB data with *all* invoices
+    combined_rows = []
+    if not sb_df.empty:
+        for _, sb_row in sb_df.iterrows():
+            for inv in invoice_rows:
+                combined_row = {**sb_row.to_dict(), **inv}
+                combined_rows.append(combined_row)
+    else:
+        combined_rows = invoice_rows
+
+    return pd.DataFrame(combined_rows)
 
 def get_port_of_destination(tables_dict):
     """
@@ -281,10 +338,6 @@ if uploaded_files:
             combined_sb_df["INVOICE NO"].notna() & (combined_sb_df["INVOICE NO"] != "")
         ]
 
-        # Clean DRAWEE ADDRESS
-        if "DRAWEE ADDRESS" in combined_sb_df.columns:
-            combined_sb_df["DRAWEE ADDRESS"] = combined_sb_df["DRAWEE ADDRESS"].str.replace(r'Y\s*\n', '', regex=True).str.strip()
-        
         # Display combined SB Data
         st.subheader("📊 Combined SB Data")
         st.dataframe(combined_sb_df)
@@ -303,52 +356,11 @@ if uploaded_files:
         st.warning("No SB Data found in the uploaded PDFs.")
 
 
-st.subheader("🔍 Filter by Shipping Bill No. (Multiple Allowed)")
 
-# Input for SB No. (comma-separated)
-sb_input = st.text_input("Enter Shipping Bill Numbers (comma-separated):")
-
-if sb_input:
-    # Split by comma and strip spaces
-    sb_list = [sb.strip() for sb in sb_input.split(" ") if sb.strip()]
-    
-    # Filter the DataFrame
-    filtered_df = combined_sb_df[combined_sb_df["SHIPPINGBILL NO"].astype(str).isin(sb_list)]
-    
-    if not filtered_df.empty:
-        st.write(f"Showing data for SB No.: {', '.join(sb_list)}")
-        st.dataframe(filtered_df)
-        
-        # Download filtered SB Data as Excel
-        towrite_filtered = BytesIO()
-        filtered_df.to_excel(towrite_filtered, index=False, engine='openpyxl')
-        towrite_filtered.seek(0)
-        
-        st.download_button(
-            label=f"⬇️ Download Filtered SB Data",
-            data=towrite_filtered,
-            file_name=f"Filtered_SB_Data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    else:
-        st.warning(f"No data found for SB No.: {', '.join(sb_list)}")
-
+################################################################################################################################
 
 st.subheader("📥 Upload Excel with Shipping Bill Numbers to Fill Data")
 
-uploaded_excel = st.file_uploader(
-    "Upload Excel file containing 'SHIPPINGBILL NO' column", type=["xlsx"]
-)
-
-import streamlit as st
-import pandas as pd
-from io import BytesIO
-from openpyxl import load_workbook
-
-st.subheader("📥 Upload Excel with Shipping Bill Numbers to Fill Data")
-
-# --- Step 1: Choose data source for combined_sb_df ---
-st.write("### Step 1: Choose Data Source for Shipping Bill Details")
 
 data_source = st.radio(
     "Select data source for filling details:",
@@ -360,7 +372,7 @@ effective_combined_df = None
 
 if data_source == "Use existing combined_sb_df":
     if 'combined_sb_df' not in locals() or combined_sb_df.empty:
-        st.error("❌ No existing combined_sb_df found in memory.")
+        st.error("❌ No existing file found in memory.")
     else:
         effective_combined_df = combined_sb_df
         st.success("✅ Using existing combined_sb_df loaded in memory.")
@@ -375,71 +387,231 @@ else:
         effective_combined_df = pd.read_excel(uploaded_combined)
         st.success("✅ Uploaded Excel loaded as combined_sb_df.")
 
-# --- Step 2: Upload target Excel to fill ---
+
+# --- Step 2: Upload target Excel (template) ---
 uploaded_excel = st.file_uploader(
     "Upload Excel file containing 'SHIPPINGBILL NO' column to fill data",
     type=["xlsx"],
     key="target_excel"
 )
 
-if uploaded_excel and effective_combined_df is not None and not effective_combined_df.empty:
-    # Read uploaded target Excel
+if uploaded_excel:
     user_sb_df = pd.read_excel(uploaded_excel)
-    
+
     if "SHIPPINGBILL NO" not in user_sb_df.columns:
         st.error("❌ The uploaded Excel must contain a column named 'SHIPPINGBILL NO'.")
     else:
-        # Normalize both for comparison
+        sb_list = user_sb_df["SHIPPINGBILL NO"].astype(str).str.strip().unique().tolist()
+        st.info(f"Looking for {len(sb_list)} Shipping Bill PDFs in Outlook folder 'abc'...")
+
+        # 🔹 Auto-download PDFs from Outlook
+        downloaded_files = download_pdfs_from_outlook("abc", sb_list)
+
+        if downloaded_files:
+            st.success(f"✅ Found and downloaded {len(downloaded_files)} PDF(s). Extracting data...")
+
+            # 🔹 Extract all PDFs into one DataFrame
+            extracted_sb_df = pd.DataFrame()
+            for pdf_path in downloaded_files:
+                sb_df = extract_sb_data(pdf_path)
+                invoice_tables_dict = extract_invoice_tables(pdf_path)
+                sb_df = extract_invoice_details_from_all_pages(invoice_tables_dict, sb_df=sb_df)
+                if sb_df is not None and not sb_df.empty:
+                    extracted_sb_df = pd.concat([extracted_sb_df, sb_df], ignore_index=True)
+
+            if not extracted_sb_df.empty:
+                st.success("✅ PDF extraction complete. Merging into template...")
+                effective_combined_df = extracted_sb_df
+            else:
+                st.warning("⚠️ No data extracted from the downloaded PDFs.")
+        else:
+            st.warning("⚠️ No matching PDFs found in Outlook folder 'abc'. Proceeding with existing/combined data if available.")
+
+    # ✅ Only continue if we now have combined data
+    if effective_combined_df is not None and not effective_combined_df.empty:
+        # Normalize both data sources
         user_sb_df["SHIPPINGBILL NO"] = user_sb_df["SHIPPINGBILL NO"].astype(str).str.strip()
         effective_combined_df["SHIPPINGBILL NO"] = effective_combined_df["SHIPPINGBILL NO"].astype(str).str.strip()
 
-        # Extract relevant columns
+        # Select relevant columns
         extracted_cols = [
             "SHIPPINGBILL NO", "PORT CODE(FROM)", "SHIPPING BILL DATE", "IE CODE", "GSTIN/TYPE",
             "CB CODE", "FINAL DESTINATION", "INVOICE NO", "INVOICE DATE", "DRAWEE NAME",
             "DRAWEE ADDRESS", "GOODS DESCRIPTION", "PORT OF DESTINATION"
         ]
-        extracted_data = effective_combined_df[
-            [c for c in extracted_cols if c in effective_combined_df.columns]
-        ].drop_duplicates(subset=["SHIPPINGBILL NO"])
-
+        available_cols = [c for c in extracted_cols if c in effective_combined_df.columns]
+        extracted_data = effective_combined_df[available_cols].drop_duplicates(subset=["SHIPPINGBILL NO"])
         extracted_dict = extracted_data.set_index("SHIPPINGBILL NO").to_dict(orient="index")
 
-        # Load workbook preserving formatting
+        st.write(f"🧾 Extracted {len(extracted_data)} unique Shipping Bills from PDFs.")
+
+        # --- Fill the template Excel (preserving formatting)
         in_memory_file = BytesIO(uploaded_excel.getvalue())
         wb = load_workbook(in_memory_file)
         ws = wb.active
 
-        header_map = {cell.value.strip(): cell.column_letter for cell in ws[1] if cell.value}
+        header_map = {str(cell.value).strip(): cell.column_letter for cell in ws[1] if cell.value}
 
+        filled_rows = 0
+        # --- Build multi-key lookup using both SB and INVOICE NO ---
+        if "INVOICE NO" in effective_combined_df.columns:
+            extracted_dict = (
+                effective_combined_df
+                .set_index(["SHIPPINGBILL NO", "INVOICE NO"])
+                .to_dict(orient="index")
+            )
+        else:
+            extracted_dict = (
+                effective_combined_df
+                .set_index("SHIPPINGBILL NO")
+                .to_dict(orient="index")
+            )
+
+        filled_rows = 0
         for row in ws.iter_rows(min_row=2):
-            sb_cell = None
-            for cell in row:
-                if cell.column_letter == header_map.get("SHIPPINGBILL NO"):
-                    sb_cell = cell
-                    break
+            sb_value = None
+            invoice_value = None
 
-            if sb_cell and sb_cell.value:
-                sb_no = str(sb_cell.value).strip()
-                if sb_no in extracted_dict:
-                    extracted_row = extracted_dict[sb_no]
-                    for field, value in extracted_row.items():
-                        if field in header_map:
-                            target_cell = ws[f"{header_map[field]}{cell.row}"]
-                            if (target_cell.value is None or str(target_cell.value).strip() == "") and value not in [None, ""]:
-                                target_cell.value = value
+            # Locate SB and Invoice cells
+            if "SHIPPINGBILL NO" in header_map:
+                sb_cell = ws[f"{header_map['SHIPPINGBILL NO']}{row[0].row}"]
+                sb_value = str(sb_cell.value).strip() if sb_cell.value else None
+            if "INVOICE NO" in header_map:
+                inv_cell = ws[f"{header_map['INVOICE NO']}{row[0].row}"]
+                invoice_value = str(inv_cell.value).strip() if inv_cell.value else None
 
+            # Lookup match
+            key = None
+            if invoice_value and (sb_value, invoice_value) in extracted_dict:
+                key = (sb_value, invoice_value)
+            elif sb_value in extracted_dict:  # fallback if invoice not found
+                key = sb_value
+
+            if key:
+                extracted_row = extracted_dict[key]
+                for field, value in extracted_row.items():
+                    if field in header_map:
+                        target_cell = ws[f"{header_map[field]}{row[0].row}"]
+                        if (target_cell.value is None or str(target_cell.value).strip() == "") and value not in [None, ""]:
+                            target_cell.value = value
+                filled_rows += 1
+
+        if filled_rows > 0:
+            st.success(f"✅ Filled data for {filled_rows} rows in your Excel template.")
+        else:
+            st.warning("⚠️ No matching Shipping Bill Numbers found in extracted data.")
+
+        # Save filled Excel
         filled_excel = BytesIO()
         wb.save(filled_excel)
         filled_excel.seek(0)
 
-        st.success("✅ Data from PDFs (or uploaded combined file) has been filled into your uploaded Excel — formatting preserved!")
-
+        # Show preview
         st.dataframe(pd.read_excel(filled_excel))
 
         st.download_button(
-            label="⬇️ Download Filled Excel (Format Preserved)",
+            label="⬇️ Download Filled Excel",
             data=filled_excel,
             file_name="Filled_SB_Data_Formatted.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+    else:
+        st.error("❌ No extracted data available to fill into the template.")
+
+#######################################################################################################################################
+st.subheader("📂 Optional: Upload SIH Excel File to Fill Remittance Data")
+
+uploaded_sih = st.file_uploader(
+    "Upload SIH file (Invoice-wise remittance data)",
+    type=["xlsx"],
+    key="sih_excel"
+)
+
+if uploaded_sih and effective_combined_df is not None and not effective_combined_df.empty:
+    # --- Read SIH without assuming header ---
+    sih_df = pd.read_excel(uploaded_sih, sheet_name="SIH", header=None)
+
+    # --- Find header row in first 5 rows ---
+    header_row_index = None
+    for i in range(5):
+        row_values = sih_df.iloc[i].astype(str).str.strip().tolist()
+        if any("Invoice Id" in val for val in row_values):
+            header_row_index = i
+            break
+
+    if header_row_index is not None:
+        # Set proper headers
+        sih_df.columns = sih_df.iloc[header_row_index]
+        sih_df = sih_df.iloc[header_row_index + 1:].reset_index(drop=True)
+        st.success(f"✅ SIH header found at row {header_row_index + 1}")
+
+        # Normalize SIH headers
+        sih_df.columns = sih_df.columns.astype(str).str.strip().str.lower()
+
+        # --- Load template Excel ---
+        in_memory_file.seek(0)
+        wb = load_workbook(in_memory_file)
+        ws = wb.active
+
+        # Normalize template headers
+        header_map = {str(cell.value).strip().lower(): cell.column_letter for cell in ws[1] if cell.value}
+
+        # --- Mapping SIH columns to template headers ---
+        sih_mapping = {
+            "invoice id": "invoice no",
+            "due date": "due date",
+            "usd": "realized amount in remittance currency",
+            "amount": "realized amount in invoice currency",
+            "drawee name": "drawee name",
+            "drawee address": "drawee address"
+            # Add more fields here if needed
+        }
+
+        # --- Fill extracted PDF data first ---
+        for row_idx, row_data in effective_combined_df.iterrows():
+            excel_row = row_idx + 2  # Assuming template starts at row 2
+            for col_name in effective_combined_df.columns:
+                col_key = col_name.strip().lower()
+                if col_key in header_map:
+                    ws[f"{header_map[col_key]}{excel_row}"].value = row_data[col_name]
+
+        # --- Fill SIH data ---
+        filled_sih_rows = 0
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            inv_no_cell_letter = header_map.get("invoice no")
+            if not inv_no_cell_letter:
+                continue  # Skip if invoice no column not found
+
+            inv_no_cell = ws[f"{inv_no_cell_letter}{row[0].row}"]
+            inv_no = str(inv_no_cell.value).strip() if inv_no_cell.value else None
+
+            if inv_no and inv_no in sih_df["invoice id"].values:
+                sih_row = sih_df[sih_df["invoice id"] == inv_no].iloc[0]
+
+                for sih_col, template_col in sih_mapping.items():
+                    template_col_letter = header_map.get(template_col.lower())
+                    if template_col_letter and sih_col in sih_row and pd.notna(sih_row[sih_col]):
+                        target_cell = ws[f"{template_col_letter}{row[0].row}"]
+
+                        # Convert due date to datetime if needed
+                        if sih_col.lower() == "due date":
+                            target_cell.value = pd.to_datetime(sih_row[sih_col])
+                        else:
+                            target_cell.value = sih_row[sih_col]
+                filled_sih_rows += 1
+
+        st.success(f"✅ Filled SIH remittance data for {filled_sih_rows} rows.")
+
+        # --- Save updated Excel ---
+        final_excel = BytesIO()
+        wb.save(final_excel)
+        final_excel.seek(0)
+        st.download_button(
+            label="⬇️ Download Template with Extracted & SIH Data Filled",
+            data=final_excel,
+            file_name="Filled_SB_Data_with_SIH.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    else:
+        st.warning("⚠️ Could not find 'Invoice Id' in the first 5 rows of SIH file.")
